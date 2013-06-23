@@ -64,8 +64,8 @@ def fetchNextState(currentState):
         statefile['sequenceNumber'] = nextSqn
 
         sf_out = open('state.txt', 'w')
-        for (k,v) in statefile.iteritems():
-            sf_out.write("%s=%s\n" % (k,v))
+        for (k, v) in statefile.iteritems():
+            sf_out.write("%s=%s\n" % (k, v))
         sf_out.close()
     except Exception, e:
         print e
