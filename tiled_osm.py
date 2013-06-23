@@ -135,8 +135,8 @@ class OSMTiler(object):
         self.api_root = api_root
         self.mercator = GlobalMercator()
         s3 = boto.connect_s3(
-            host='objects.dreamhost.com',
-            calling_format=boto.s3.connection.OrdinaryCallingFormat(),
+            #host='objects.dreamhost.com',
+            #calling_format=boto.s3.connection.OrdinaryCallingFormat(),
         )
         self.bucket = s3.create_bucket(bucket_name)
 
@@ -153,9 +153,17 @@ class OSMTiler(object):
 
         return tmpfile
 
-    def update_tile(self, zoom, x, y):
+    def delete_tiles(self, tiles):
+        tile_keys = ['%s/%s/%s.osm' % (zoom, x, y) for (zoom, x, y) in tiles]
+        return self.bucket.delete_keys(tile_keys)
+
+    def tile_bbox(self, zoom, x, y):
         (tmsx, tmsy) = self.mercator.GoogleTile(x, y, zoom)
         bbox = self.mercator.TileLatLonBounds(tmsx, tmsy, zoom)
+        return bbox
+
+    def update_tile(self, zoom, x, y):
+        bbox = self.tile_bbox(zoom, x, y)
 
         key_str = "%d/%d/%d.osm" % (zoom, x, y)
 
@@ -163,7 +171,7 @@ class OSMTiler(object):
         osm_tile_file = OSMTiler.downloadChunks(url)
 
         k = self.bucket.new_key(key_str)
-        k.set_contents_from_filename(osm_tile_file.name, policy='public-read', headers={'Content-Type': 'text/xml; charset=utf-8'})
+        k.set_contents_from_filename(osm_tile_file.name, policy='public-read', headers={'Content-Type': 'text/xml; charset=utf-8', 'Access-Control-Allow-Origin': '*'})
         os.unlink(osm_tile_file.name)
 
         return k.generate_url(0, query_auth=False, force_http=True)

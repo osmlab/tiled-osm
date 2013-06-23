@@ -7,83 +7,30 @@ import datetime
 import calendar
 import gzip
 import time
+import boto
+import boto.s3.connection
 from tiled_osm import OSMTiler, GlobalMercator
 
+ZOOM = 16
 
-# Parse the diff and write out a simplified version
-class OscHandler():
-    def __init__(self):
-        self.changes = {}
-        self.nodes = {}
-        self.ways = {}
-        self.relations = {}
-        self.action = ""
-        self.primitive = {}
-        self.missingNds = set()
+def parseOsm(source):
+    tiles_to_expire = set()
 
-    def startElement(self, name, attributes):
-        if name in ('modify', 'delete', 'create'):
-            self.action = name
-        if name in ('node', 'way', 'relation'):
-            self.primitive['id'] = int(attributes['id'])
-            self.primitive['version'] = int(attributes['version'])
-            self.primitive['changeset'] = int(attributes['changeset'])
-            self.primitive['user'] = attributes.get('user')
-            self.primitive['timestamp'] = isoToTimestamp(attributes['timestamp'])
-            self.primitive['tags'] = {}
-            self.primitive['action'] = self.action
-        if name == 'node':
-            self.primitive['lat'] = float(attributes['lat'])
-            self.primitive['lon'] = float(attributes['lon'])
-        elif name == 'tag':
-            key = attributes['k']
-            val = attributes['v']
-            self.primitive['tags'][key] = val
-        elif name == 'way':
-            self.primitive['nodes'] = []
-        elif name == 'relation':
-            self.primitive['members'] = []
-        elif name == 'nd':
-            ref = int(attributes['ref'])
-            self.primitive['nodes'].append(ref)
-            if ref not in self.nodes:
-                self.missingNds.add(ref)
-        elif name == 'member':
-            self.primitive['members'].append({
-                'type': attributes['type'],
-                'role': attributes['role'],
-                'ref': attributes['ref']
-            })
-
-    def endElement(self, name):
-        if name == 'node':
-            self.nodes[self.primitive['id']] = self.primitive
-        elif name == 'way':
-            self.ways[self.primitive['id']] = self.primitive
-        elif name == 'relation':
-            self.relations[self.primitive['id']] = self.primitive
-        if name in ('node', 'way', 'relation'):
-            self.primitive = {}
-
-
-def isoToTimestamp(isotime):
-    t = datetime.datetime.strptime(isotime, "%Y-%m-%dT%H:%M:%SZ")
-    return calendar.timegm(t.utctimetuple())
-
-
-def parseOsm(source, handler):
     for event, elem in ElementTree.iterparse(source, events=('start', 'end')):
         if event == 'start':
-            handler.startElement(elem.tag, elem.attrib)
-        elif event == 'end':
-            handler.endElement(elem.tag)
+            if elem.tag in ('nd', 'node'):
+                if 'lat' in elem.attrib and 'lon' in elem.attrib:
+                    (tx, ty) = mercator.LatLonToGoogleTile(float(elem.attrib['lat']), float(elem.attrib['lon']), ZOOM)
+                    tiles_to_expire.add((ZOOM, tx, ty))
         elem.clear()
+
+    return tiles_to_expire
 
 
 def minutelyUpdateRun(state):
     # Grab the next sequence number and build a URL out of it
     sqnStr = state['sequenceNumber'].zfill(9)
-    url = "http://planet.openstreetmap.org/replication/minute/%s/%s/%s.osc.gz" % (sqnStr[0:3], sqnStr[3:6], sqnStr[6:9])
+    url = "http://overpass-api.de/augmented_diffs/%s/%s/%s.osc.gz" % (sqnStr[0:3], sqnStr[3:6], sqnStr[6:9])
 
     print "Downloading change file (%s)." % (url)
     content = urllib2.urlopen(url)
@@ -91,24 +38,17 @@ def minutelyUpdateRun(state):
     gzipper = gzip.GzipFile(fileobj=content)
 
     print "Parsing change file."
-    handler = OscHandler()
-    parseOsm(gzipper, handler)
-
-    return (handler.nodes, handler.ways, handler.relations)
+    return parseOsm(gzipper)
 
 
-def readState():
-    # Read the state.txt
-    sf = open('state.txt', 'r')
-
+def readState(state_file):
     state = {}
-    for line in sf:
+
+    for line in state_file:
         if line[0] == '#':
             continue
         (k, v) = line.split('=')
         state[k] = v.strip().replace("\\:", ":")
-
-    sf.close()
 
     return state
 
@@ -117,12 +57,16 @@ def fetchNextState(currentState):
     # Download the next state file
     nextSqn = int(currentState['sequenceNumber']) + 1
     sqnStr = str(nextSqn).zfill(9)
-    url = "http://planet.openstreetmap.org/replication/minute/%s/%s/%s.state.txt" % (sqnStr[0:3], sqnStr[3:6], sqnStr[6:9])
+    url = "http://overpass-api.de/augmented_diffs/%s/%s/%s.state.txt" % (sqnStr[0:3], sqnStr[3:6], sqnStr[6:9])
     try:
         u = urllib2.urlopen(url)
-        statefile = open('state.txt', 'w')
-        statefile.write(u.read())
-        statefile.close()
+        statefile = readState(u)
+        statefile['sequenceNumber'] = nextSqn
+
+        sf_out = open('state.txt', 'w')
+        for (k,v) in statefile.iteritems():
+            sf_out.write("%s=%s\n" % (k,v))
+        sf_out.close()
     except Exception, e:
         print e
         return False
@@ -130,27 +74,23 @@ def fetchNextState(currentState):
     return True
 
 if __name__ == "__main__":
-    zoom = 17
     mercator = GlobalMercator()
     tiler = OSMTiler()
     while True:
-        state = readState()
+        state = readState(open('state.txt', 'r'))
 
         start = time.time()
-        (nodes, ways, relations) = minutelyUpdateRun(state)
-
-        z17_tiles_to_expire = set()
-        for (id, node) in nodes.iteritems():
-            (tx, ty) = mercator.LatLonToGoogleTile(node['lat'], node['lon'], 17)
-            z17_tiles_to_expire.add((17, tx, ty))
-
-        for (zoom, x, y) in z17_tiles_to_expire:
-            url = tiler.update_tile(zoom, x, y)
-            print "Url is %s" % url
+        tiles = minutelyUpdateRun(state)
+        tiles = sorted(tiles, key=lambda x: x[0]+x[1]+x[2])
 
         elapsed = time.time() - start
+        print "Found %s tiles to expire in %2.1f seconds." % (len(tiles), elapsed)
 
-        stateTs = datetime.datetime.strptime(state['timestamp'], "%Y-%m-%dT%H:%M:%SZ")
+        result = tiler.delete_tiles(tiles)
+        elapsed = time.time() - start
+        print "Busted %s/%s tiles in %2.1f seconds." % (len(result.deleted), (len(result.errors)+len(result.deleted)), elapsed)
+
+        stateTs = datetime.datetime.strptime(state['osm_base'], "%Y-%m-%dT%H:%M:%SZ")
         nextTs = stateTs + datetime.timedelta(minutes=1)
 
         if datetime.datetime.utcnow() < nextTs:
